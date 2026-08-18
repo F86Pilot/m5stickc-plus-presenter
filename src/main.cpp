@@ -7,16 +7,25 @@
 //        ^  NEXT     big M5 button, top          -> Right Arrow
 //   <  BACK          side button, middle-left    -> Left Arrow
 //
-// The UI has three states:
+// The UI has four states:
 //   Boot     - title fades up, then rises to make room
 //   Pairing  - broadcast ripples while advertising
-//   Ready    - the button legend, assembled by an animation on pair
+//   Ready    - the button legend; each press nudges its arrow
+//   BtOff    - Bluetooth switched off on purpose (double-tap power)
+//
+// Side (BACK) button:
+//   tap         previous slide
+//   hold ~1s    toggle Bluetooth off/on (frees the iPad's on-screen keyboard
+//               while the remote sits on a charger)
+// Power button:
+//   hold ~1.5s  cancellable shutdown countdown
 //
 // Build and flash:  pio run -t upload
 // Watch the serial: pio device monitor
 
 #include <M5Unified.h>
 #include <HijelHID_BLEKeyboard.h>
+#include <math.h>
 
 // ---------------------------------------------------------------------------
 // Change these to remap the buttons. Other useful keys: KEY_PAGE_DOWN /
@@ -29,20 +38,26 @@ static const uint8_t KEY_PREV = KEY_LEFT;
 // Portrait with the big button at the top. Set to 0 to flip 180 degrees.
 static const uint8_t SCREEN_ROTATION = 2;
 
+// How far an arrow+label nudges when its button is pressed, in pixels.
+static const int PRESS_BUMP_PX = 8;
+
+// How long to hold the side (BACK) button to toggle Bluetooth, in ms. Well
+// above a normal back-tap so a slightly deliberate press never toggles by
+// accident. This lives on a front GPIO button on purpose: the power button
+// routes through the AXP192, which conflates a firm tap with a hold and makes
+// multi-tap gestures there unreliable.
+static const uint32_t BT_HOLD_MS = 900;
+
 HijelHID_BLEKeyboard kb("Slide Remote", "Preston", 100);
 
 static const int SCREEN_W = 135;
 static const int SCREEN_H = 240;
 
-// Ready-mode layout. Each dynamic band is fully cleared before repaint -- the
-// height belongs to the region, not to the text going into it, or taller old
-// text shows through shorter new text.
+// Ready-mode text positions.
 static const int Y_STATUS  = 194;
-static const int H_STATUS  = 18;
 static const int Y_BATTERY = 218;
-static const int H_BATTERY = 10;
 
-// Pairing-mode ripple geometry.
+// Ripple geometry, shared by the pairing animation and the BT-off motif.
 static const int RIPPLE_CX = 67;
 static const int RIPPLE_CY = 148;
 static const int RIPPLE_MIN = 8;
@@ -53,8 +68,9 @@ static const uint8_t BRIGHT_ACTIVE = 100;
 static const uint8_t BRIGHT_IDLE   = 15;
 static const uint32_t IDLE_AFTER_MS = 30000;
 
-enum class UiMode { Pairing, Ready };
+enum class UiMode { Pairing, Ready, BtOff };
 static UiMode   mode         = UiMode::Pairing;
+static bool     btEnabled    = true;
 static bool     dimmed       = false;
 static uint32_t lastActivity = 0;
 static uint32_t lastBattery  = 0;
@@ -62,9 +78,8 @@ static int32_t  lastBattPct  = -1;
 static float    ripplePhase  = 0.0f;
 static uint32_t lastRipple   = 0;
 
-// Off-screen buffer for the animated modes. Drawing a whole frame here and
-// pushing it once avoids the flicker of erase-then-redraw straight to the
-// panel. Freed on entering Ready, which is the long-lived state.
+// Off-screen buffer. Every frame is drawn here and pushed once, so nothing
+// flickers from erase-then-redraw. Allocated once and kept for the whole run.
 static M5Canvas cv(&M5.Display);
 static bool canvasOk = false;
 
@@ -84,50 +99,39 @@ static float segment(float t, float from, float to) {
 
 static float easeOut(float t) { return 1.0f - (1.0f - t) * (1.0f - t); }
 
+// Whichever surface we are drawing to this frame.
+static LovyanGFX *surface() {
+  return canvasOk ? (LovyanGFX *)&cv : (LovyanGFX *)&M5.Display;
+}
+static void beginFrame() {
+  if (canvasOk) cv.fillSprite(TFT_BLACK); else M5.Display.fillScreen(TFT_BLACK);
+}
+static void endFrame() {
+  if (canvasOk) cv.pushSprite(0, 0);
+}
+
 // ---------------------------------------------------------------------------
-// Ready mode: static legend plus two dynamic bands, drawn straight to the panel
+// Legend: one arrow pointing at each physical button
+//
+// nextY / backX position the arrows during the assemble animation; the fades
+// and divider widths let it build up piece by piece. nextDy / backDx nudge a
+// whole group (arrow plus its label) for the per-press bump.
 // ---------------------------------------------------------------------------
 
-static void drawBand(int y, int h, int dy, uint16_t colour, uint8_t size,
-                     const char *text) {
-  M5.Display.fillRect(0, y, SCREEN_W, h, TFT_BLACK);
-  M5.Display.setFont(&fonts::Font0);
-  M5.Display.setTextColor(colour, TFT_BLACK);
-  M5.Display.setTextSize(size);
-  M5.Display.setTextDatum(top_center);
-  M5.Display.drawString(text, SCREEN_W / 2, y + dy);
-}
-
-static void drawStatus(bool paired) {
-  if (paired) {
-    drawBand(Y_STATUS, H_STATUS, 0, TFT_GREEN, 2, "PAIRED");
-  } else {
-    drawBand(Y_STATUS, H_STATUS, 5, TFT_ORANGE, 1, "waiting to pair");
-  }
-}
-
-static void drawBattery(int32_t pct) {
-  char buf[16];
-  snprintf(buf, sizeof(buf), "%ld%%", (long)pct);
-  drawBand(Y_BATTERY, H_BATTERY, 0, TFT_DARKGREY, 1, buf);
-}
-
-// The permanent legend: one arrow pointing at each physical button. Drawn into
-// whichever target is passed, so the same geometry serves both the animation
-// (canvas) and the settled screen (panel).
 static void paintLegend(LovyanGFX *g, float nextY, float nextFade,
                         float divTop, float backX, float backFade,
-                        float divBottom, float titleFade) {
-  // Up arrow -> big M5 button, just above the top edge of the screen.
-  int ny = (int)nextY;
-  g->fillTriangle(67, ny, 50, ny + 20, 84, ny + 20, TFT_WHITE);
-
+                        float divBottom, float titleFade,
+                        int nextDy = 0, int backDx = 0) {
   g->setFont(&fonts::Font0);
   g->setTextDatum(top_center);
+
+  // Up arrow -> big M5 button, just above the top edge of the screen.
+  int ny = (int)nextY + nextDy;
+  g->fillTriangle(67, ny, 50, ny + 20, 84, ny + 20, TFT_WHITE);
   if (nextFade > 0) {
     g->setTextColor(fade(255, 255, 255, nextFade));
     g->setTextSize(3);
-    g->drawString("NEXT", SCREEN_W / 2, 36);
+    g->drawString("NEXT", SCREEN_W / 2, 36 + nextDy);
   }
 
   if (divTop > 0) {
@@ -136,13 +140,12 @@ static void paintLegend(LovyanGFX *g, float nextY, float nextFade,
   }
 
   // Left arrow -> side button on the middle-left edge.
-  int bx = (int)backX;
+  int bx = (int)backX + backDx;
   g->fillTriangle(bx, 120, bx + 20, 102, bx + 20, 138, TFT_WHITE);
-
   if (backFade > 0) {
     g->setTextColor(fade(255, 255, 255, backFade));
     g->setTextSize(2);
-    g->drawString("BACK", SCREEN_W / 2, 112);
+    g->drawString("BACK", SCREEN_W / 2 + backDx, 112);
   }
 
   if (divBottom > 0) {
@@ -157,9 +160,43 @@ static void paintLegend(LovyanGFX *g, float nextY, float nextFade,
   }
 }
 
-static void drawLegendSettled() {
-  M5.Display.fillScreen(TFT_BLACK);
-  paintLegend(&M5.Display, 3, 1, 1, 3, 1, 1, 1);
+// Full settled Ready frame (legend + status + battery), with an optional
+// per-press bump applied to one group.
+static void paintReadyInto(LovyanGFX *g, int nextDy, int backDx) {
+  paintLegend(g, 3, 1, 1, 3, 1, 1, 1, nextDy, backDx);
+
+  g->setFont(&fonts::Font0);
+  g->setTextDatum(top_center);
+  g->setTextColor(TFT_GREEN);
+  g->setTextSize(2);
+  g->drawString("PAIRED", SCREEN_W / 2, Y_STATUS);
+
+  if (lastBattPct >= 0) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%ld%%", (long)lastBattPct);
+    g->setTextColor(TFT_DARKGREY);
+    g->setTextSize(1);
+    g->drawString(buf, SCREEN_W / 2, Y_BATTERY);
+  }
+}
+
+static void renderReady(int nextDy = 0, int backDx = 0) {
+  beginFrame();
+  paintReadyInto(surface(), nextDy, backDx);
+  endFrame();
+}
+
+// A short, subtle nudge: the pressed arrow and its label move, then spring
+// back. NEXT drops down; BACK slides right. sinf gives a smooth out-and-back.
+static void pressBump(bool isNext) {
+  const int N = 10;
+  for (int i = 0; i <= N; i++) {
+    float phase = sinf((float)i / N * 3.14159f);   // 0 -> 1 -> 0
+    int d = (int)(PRESS_BUMP_PX * phase);
+    renderReady(isNext ? d : 0, isNext ? 0 : d);
+    delay(12);
+  }
+  renderReady(0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -187,7 +224,6 @@ static void bootAnimation() {
     return;
   }
 
-  // Fade the backlight up with the title already on the panel.
   cv.fillSprite(TFT_BLACK);
   paintTitle(&cv, TITLE_REST, 1.0f);
   cv.pushSprite(0, 0);
@@ -197,7 +233,6 @@ static void bootAnimation() {
   }
   delay(400);
 
-  // Lift it to the top to clear space for the pairing ripples.
   for (int i = 0; i <= 16; i++) {
     float e = easeOut(i / 16.0f);
     int y = TITLE_REST + (int)((TITLE_TOP - TITLE_REST) * e);
@@ -213,34 +248,34 @@ static void bootAnimation() {
 // ---------------------------------------------------------------------------
 
 static void paintPairingFrame(float phase) {
-  cv.fillSprite(TFT_BLACK);
-  paintTitle(&cv, 28, 1.0f);
+  beginFrame();
+  paintTitle(surface(), 28, 1.0f);
 
+  LovyanGFX *g = surface();
   for (int i = 0; i < RIPPLE_RINGS; i++) {
     float p = phase + (float)i / RIPPLE_RINGS;
     if (p >= 1.0f) p -= 1.0f;
     int r = RIPPLE_MIN + (int)(p * (RIPPLE_MAX - RIPPLE_MIN));
-    cv.drawCircle(RIPPLE_CX, RIPPLE_CY, r, fade(0, 200, 255, 1.0f - p));
+    g->drawCircle(RIPPLE_CX, RIPPLE_CY, r, fade(0, 200, 255, 1.0f - p));
   }
-  cv.fillCircle(RIPPLE_CX, RIPPLE_CY, 4, fade(0, 200, 255, 1.0f));
+  g->fillCircle(RIPPLE_CX, RIPPLE_CY, 4, fade(0, 200, 255, 1.0f));
 
-  cv.setFont(&fonts::Font0);
-  cv.setTextDatum(top_center);
-  cv.setTextSize(1);
-  cv.setTextColor(TFT_ORANGE);
-  cv.drawString("waiting to pair", SCREEN_W / 2, 205);
+  g->setFont(&fonts::Font0);
+  g->setTextDatum(top_center);
+  g->setTextSize(1);
+  g->setTextColor(TFT_ORANGE);
+  g->drawString("waiting to pair", SCREEN_W / 2, 205);
 
   if (lastBattPct >= 0) {
     char buf[16];
     snprintf(buf, sizeof(buf), "%ld%%", (long)lastBattPct);
-    cv.setTextColor(TFT_DARKGREY);
-    cv.drawString(buf, SCREEN_W / 2, 222);
+    g->setTextColor(TFT_DARKGREY);
+    g->drawString(buf, SCREEN_W / 2, 222);
   }
-  cv.pushSprite(0, 0);
+  endFrame();
 }
 
 static void tickPairing() {
-  if (!canvasOk) return;
   uint32_t now = millis();
   if (now - lastRipple < 40) return;
   lastRipple = now;
@@ -287,25 +322,73 @@ static void legendInAnimation() {
 }
 
 // ---------------------------------------------------------------------------
+// BT off: switched off deliberately. The Bluetooth rune with a red cross-out,
+// so it reads instantly as "the radio is off".
+// ---------------------------------------------------------------------------
+
+// Draw a line with a bit of weight by stamping it across a small square.
+static void thickLine(LovyanGFX *g, int x0, int y0, int x1, int y1,
+                      uint16_t colour, int weight) {
+  int h = weight / 2;
+  for (int dx = -h; dx <= h; dx++)
+    for (int dy = -h; dy <= h; dy++)
+      g->drawLine(x0 + dx, y0 + dy, x1 + dx, y1 + dy, colour);
+}
+
+// The Bluetooth mark: a vertical spine, two triangular flags on the right, and
+// two diagonals crossing through the centre to the left knees.
+static void drawBluetoothLogo(LovyanGFX *g, int cx, int cy, int hh, int hw,
+                              uint16_t colour, int weight) {
+  int top = cy - hh, bot = cy + hh;
+  int q1 = cy - hh / 2, q3 = cy + hh / 2;
+  int r = cx + hw, l = cx - hw;
+  thickLine(g, cx, top, cx, bot, colour, weight);   // spine
+  thickLine(g, cx, top, r, q1, colour, weight);     // top -> upper-right knee
+  thickLine(g, cx, bot, r, q3, colour, weight);     // bottom -> lower-right knee
+  thickLine(g, r, q1, l, q3, colour, weight);       // upper-right -> lower-left
+  thickLine(g, r, q3, l, q1, colour, weight);       // lower-right -> upper-left
+}
+
+static void renderBtOff() {
+  beginFrame();
+  LovyanGFX *g = surface();
+
+  const int CX = RIPPLE_CX, CY = 124;
+  drawBluetoothLogo(g, CX, CY, 30, 17, fade(60, 130, 210, 1.0f), 2);
+
+  // Red cross-out, drawn over the logo and past its corners.
+  thickLine(g, CX - 26, CY - 34, CX + 26, CY + 34, TFT_RED, 3);
+
+  g->setFont(&fonts::Font0);
+  g->setTextDatum(top_center);
+  g->setTextSize(1);
+  g->setTextColor(fade(150, 150, 150, 1.0f));
+  g->drawString("BLUETOOTH OFF", SCREEN_W / 2, 178);
+  g->setTextColor(TFT_DARKGREY);
+  g->drawString("hold BACK button", SCREEN_W / 2, 200);
+  g->drawString("to turn back on", SCREEN_W / 2, 213);
+  endFrame();
+}
+
+// ---------------------------------------------------------------------------
 
 static void enterReady() {
   pairSuccessAnimation();
   legendInAnimation();
-  if (canvasOk) {
-    cv.deleteSprite();          // Ready mode paints straight to the panel
-    canvasOk = false;
-  }
-  drawLegendSettled();
-  drawStatus(true);
-  if (lastBattPct >= 0) drawBattery(lastBattPct);
+  renderReady();
   mode = UiMode::Ready;
 }
 
 static void enterPairing() {
-  if (!canvasOk) canvasOk = (cv.createSprite(SCREEN_W, SCREEN_H) != nullptr);
-  M5.Display.fillScreen(TFT_BLACK);
+  beginFrame();
+  endFrame();
   ripplePhase = 0.0f;
   mode = UiMode::Pairing;
+}
+
+static void enterBtOff() {
+  mode = UiMode::BtOff;
+  renderBtOff();
 }
 
 static void markActive() {
@@ -328,6 +411,23 @@ static void sendKey(uint8_t key, const char *label) {
   Serial.printf("sent %s\n", label);
 }
 
+// Hold the side (BACK) button to disconnect from Bluetooth without powering
+// off. end() drops the host, so the iPad restores its on-screen keyboard;
+// begin() re-advertises and the existing bond reconnects on its own.
+static void toggleBt() {
+  btEnabled = !btEnabled;
+  markActive();
+  if (btEnabled) {
+    Serial.println("BT enabled");
+    kb.begin();
+    enterPairing();
+  } else {
+    Serial.println("BT disabled");
+    kb.end();
+    enterBtOff();
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Shutdown: a countdown you can call off
 //
@@ -339,7 +439,7 @@ static void sendKey(uint8_t key, const char *label) {
 // straight away and can call the whole thing off with any other button.
 // ---------------------------------------------------------------------------
 
-static const int SHUTDOWN_SECONDS = 6;
+static const int SHUTDOWN_SECONDS = 5;
 static uint32_t suppressHoldUntil = 0;
 
 // Buy room to finish. Register 0x36 bits[1:0] are the hardware power-off hold
@@ -355,8 +455,8 @@ static void paintShutdownFrame(int remaining, float frac) {
   char buf[8];
   snprintf(buf, sizeof(buf), "%d", remaining);
 
-  LovyanGFX *g = canvasOk ? (LovyanGFX *)&cv : (LovyanGFX *)&M5.Display;
-  if (canvasOk) { cv.fillSprite(TFT_BLACK); } else { M5.Display.fillScreen(TFT_BLACK); }
+  beginFrame();
+  LovyanGFX *g = surface();
 
   g->setFont(&fonts::Font0);
   g->setTextDatum(top_center);
@@ -364,7 +464,6 @@ static void paintShutdownFrame(int remaining, float frac) {
   g->setTextColor(TFT_ORANGE);
   g->drawString("POWERING DOWN", SCREEN_W / 2, 40);
 
-  // A ring that empties as the countdown runs.
   if (frac > 0.01f) {
     g->drawArc(67, 130, 40, 44, -90, -90 + 360.0f * frac, fade(255, 140, 0, 1.0f));
   }
@@ -378,17 +477,16 @@ static void paintShutdownFrame(int remaining, float frac) {
   g->setTextDatum(top_center);
   g->setTextColor(TFT_DARKGREY);
   g->drawString("any button cancels", SCREEN_W / 2, 200);
+  endFrame();
+}
 
-  if (canvasOk) cv.pushSprite(0, 0);
+static void restoreCurrentMode() {
+  if (mode == UiMode::Ready)      renderReady();
+  else if (mode == UiMode::BtOff) renderBtOff();
+  else                            enterPairing();
 }
 
 static void shutdownSequence() {
-  bool createdHere = false;
-  if (!canvasOk) {
-    canvasOk = (cv.createSprite(SCREEN_W, SCREEN_H) != nullptr);
-    createdHere = canvasOk;
-  }
-
   M5.Display.setBrightness(BRIGHT_ACTIVE);
   dimmed = false;
   Serial.println("shutdown countdown started");
@@ -418,14 +516,7 @@ static void shutdownSequence() {
   }
 
   Serial.println("shutdown cancelled");
-  if (createdHere) { cv.deleteSprite(); canvasOk = false; }
-  if (mode == UiMode::Ready) {
-    drawLegendSettled();
-    drawStatus(true);
-    if (lastBattPct >= 0) drawBattery(lastBattPct);
-  } else {
-    enterPairing();
-  }
+  restoreCurrentMode();
   suppressHoldUntil = millis() + 1500;   // do not re-trigger on the same hold
   markActive();
 }
@@ -434,6 +525,7 @@ void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
   extendHardwarePowerOffDelay();
+  M5.BtnB.setHoldThresh(BT_HOLD_MS);   // long-press BACK toggles Bluetooth
 
   M5.Display.setRotation(SCREEN_ROTATION);
 
@@ -455,23 +547,30 @@ void setup() {
 void loop() {
   M5.update();   // reads and debounces the buttons
 
-  if (M5.BtnPWR.wasHold() && millis() > suppressHoldUntil) shutdownSequence();
+  if (M5.BtnPWR.wasHold() && millis() > suppressHoldUntil) { shutdownSequence(); return; }
 
-  bool paired = kb.isPaired();
-  if (paired && mode == UiMode::Pairing) {
-    Serial.println("paired");
-    enterReady();
-    markActive();
-  } else if (!paired && mode == UiMode::Ready) {
-    Serial.println("disconnected");
-    enterPairing();
-    markActive();
+  // Hold the side button to toggle Bluetooth. Outside the btEnabled block so it
+  // works while off, to turn it back on. A hold never also fires a click, so
+  // this can't send a stray BACK.
+  if (M5.BtnB.wasHold()) { toggleBt(); return; }
+
+  if (btEnabled) {
+    bool paired = kb.isPaired();
+    if (paired && mode == UiMode::Pairing) {
+      Serial.println("paired");
+      enterReady();
+      markActive();
+    } else if (!paired && mode == UiMode::Ready) {
+      Serial.println("disconnected");
+      enterPairing();
+      markActive();
+    }
+
+    if (M5.BtnA.wasPressed()) { sendKey(KEY_NEXT, "NEXT"); if (mode == UiMode::Ready) pressBump(true); }
+    if (M5.BtnB.wasClicked()) { sendKey(KEY_PREV, "BACK"); if (mode == UiMode::Ready) pressBump(false); }
+
+    if (mode == UiMode::Pairing) tickPairing();
   }
-
-  if (M5.BtnA.wasPressed()) sendKey(KEY_NEXT, "NEXT");
-  if (M5.BtnB.wasPressed()) sendKey(KEY_PREV, "BACK");
-
-  if (mode == UiMode::Pairing) tickPairing();
 
   uint32_t now = millis();
 
@@ -482,8 +581,8 @@ void loop() {
     int32_t pct = M5.Power.getBatteryLevel();
     if (pct != lastBattPct) {
       lastBattPct = pct;
-      kb.setBatteryLevel((uint8_t)pct);
-      if (mode == UiMode::Ready) drawBattery(pct);
+      if (btEnabled) kb.setBatteryLevel((uint8_t)pct);
+      if (mode == UiMode::Ready) renderReady();
     }
   }
 

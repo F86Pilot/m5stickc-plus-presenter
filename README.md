@@ -20,11 +20,20 @@ pointing at each button, so the device explains itself:
        87%
 ```
 
-| Button | Sends | Does |
+| Button | Gesture | Does |
 |---|---|---|
-| Big M5 button, top | Right Arrow | next slide |
-| Side button, middle-left | Left Arrow | previous slide |
-| Power button, held ~1.5s | — | cancellable shutdown countdown |
+| Big M5 button, top | tap | next slide (Right Arrow) |
+| Side button, middle-left | tap | previous slide (Left Arrow) |
+| Side button, middle-left | hold ~1s | toggle Bluetooth off/on |
+| Power button | hold ~1.5s | cancellable shutdown countdown |
+
+Each slide press gives the arrow and its label a small nudge, so a press is
+visible on the device as well as on the screen.
+
+**Toggling Bluetooth off** (hold the side button) disconnects the remote without
+powering it down, which brings the iPad's on-screen keyboard back — useful when
+the remote is sitting on a charger and would otherwise stay connected. Hold the
+side button again to reconnect; the existing pairing is remembered.
 
 It advertises as **"Slide Remote"** — that is the name you look for in the iPad's
 Bluetooth list, and it is deliberately not the repo name. Renaming it forces a
@@ -115,6 +124,12 @@ easy mistake.
 - **Don't use `M5.BtnPWR.wasPressed()`.** For the AXP192 power key M5Unified only
   ever sets `clicked` or `hold`. `wasPressed()` compiles and never fires; use
   `wasClicked()`.
+- **Don't put a multi-tap gesture on the power button.** The AXP192 reports the
+  power key as pre-digested short/long-press events and readily calls a firm tap
+  a "hold", so a double-tap toggle there fires the shutdown countdown instead. BT
+  toggle lives on the side button (plain GPIO, deterministic) for this reason.
+  Lowering the multiclick window with `setHoldThresh` also lowers the hold
+  threshold on the AXP192, so it is not a fix.
 
 ## Notes on the build
 
