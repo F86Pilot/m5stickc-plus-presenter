@@ -152,3 +152,7 @@ easy mistake.
   power-off hold from ~6s to 10s, so the countdown is not cut off mid-run. The
   auto-shutdown bit is left enabled on purpose: a hung firmware can still be
   switched off by holding the button.
+
+## License
+
+[MIT](LICENSE) — free to use, modify, and share. Keep the copyright notice; no warranty.
