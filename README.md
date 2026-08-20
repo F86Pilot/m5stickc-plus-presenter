@@ -4,6 +4,10 @@ An M5StickC PLUS turned into a Bluetooth slide clicker for **Google Slides on an
 iPad**. It pairs as a BLE HID keyboard and sends arrow keys, so it works with
 anything that takes keyboard input — Slides, Keynote, PowerPoint, a browser.
 
+<p align="center">
+  <img src="images/slide-remote.jpg" width="360" alt="M5StickC PLUS running the Slide Remote firmware, showing the NEXT / BACK legend and PAIRED status, held in front of an iPad">
+</p>
+
 Held in **portrait with the big M5 button at the top**. The screen draws an arrow
 pointing at each button, so the device explains itself:
 
