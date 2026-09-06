@@ -29,6 +29,7 @@ pointing at each button, so the device explains itself:
 | Big M5 button, top | tap | next slide (Right Arrow) |
 | Side button, middle-left | tap | previous slide (Left Arrow) |
 | Side button, middle-left | hold ~1s | toggle Bluetooth off/on |
+| Big M5 button (while off) | hold ~1s | pair a new device (wipes pairings) |
 | Power button | hold ~1.5s | cancellable shutdown countdown |
 
 Each slide press gives the arrow and its label a small nudge, so a press is
@@ -37,7 +38,19 @@ visible on the device as well as on the screen.
 **Toggling Bluetooth off** (hold the side button) disconnects the remote without
 powering it down, which brings the iPad's on-screen keyboard back — useful when
 the remote is sitting on a charger and would otherwise stay connected. Hold the
-side button again to reconnect; the existing pairing is remembered.
+side button again to reconnect; the existing pairing is remembered. The off
+screen also shows the battery level and a charging bolt.
+
+**Switching devices.** With Bluetooth off, hold the big button (`hold NEXT: pair
+new` on the off screen) to erase every stored pairing and advertise fresh, so a
+different device can bond. Afterwards, **forget "Slide Remote" on the old device**
+too — the remote no longer recognises it, so the old device would otherwise keep
+trying to reconnect.
+
+**Battery.** The percentage shows on screen and mirrors to the host's Bluetooth
+panel. It turns green with a small bolt while charging. Left idle on battery for
+15 minutes it powers off on its own (a 30-second warning shows first, cancelled
+by any button); on a charger it stays awake.
 
 It advertises as **"Slide Remote"** — that is the name you look for in the iPad's
 Bluetooth list, and it is deliberately not the repo name. Renaming it forces a
@@ -82,6 +95,11 @@ PAIRED when the bond completes, and reconnects on its own after that.
 If a host refuses to reconnect, forget the device there and pair again — a stale
 bond is the usual cause.
 
+To move the remote to a **different** device: turn Bluetooth off (hold the side
+button), then hold the big button to reset pairing, and pair "Slide Remote" from
+the new device's Bluetooth settings. Forget it on the old device so the two do
+not fight over the connection.
+
 ## Customising
 
 Button mappings are at the top of `src/main.cpp`:
@@ -94,7 +112,9 @@ mapping), `KEY_ESCAPE` (leave present mode). The on-screen legend in
 `drawLegend()` is separate text and will not follow a changed keycode.
 
 `SCREEN_ROTATION` is `2` (portrait, big button at top); `0` flips it 180 degrees.
-`SHUTDOWN_SECONDS` is the countdown length.
+`SHUTDOWN_SECONDS` is the manual countdown length. `AUTO_OFF_MS` / `AUTO_WARN_MS`
+set the idle auto-off timer and its warning; `BT_HOLD_MS` and `PAIR_HOLD_MS` are
+the side- and NEXT-button hold times.
 
 ## Things that look like bugs but are not
 

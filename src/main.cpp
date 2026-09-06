@@ -17,6 +17,8 @@
 //   tap         previous slide
 //   hold ~1s    toggle Bluetooth off/on (frees the iPad's on-screen keyboard
 //               while the remote sits on a charger)
+// While Bluetooth is off:
+//   hold NEXT   wipe pairings and advertise for a new device
 // Power button:
 //   hold ~1.5s  cancellable shutdown countdown
 //
@@ -48,6 +50,10 @@ static const int PRESS_BUMP_PX = 8;
 // multi-tap gestures there unreliable.
 static const uint32_t BT_HOLD_MS = 900;
 
+// How long to hold NEXT on the off screen to pair a new device, in ms. Longer
+// than the BT toggle so it reads as a distinct, deliberate action.
+static const uint32_t PAIR_HOLD_MS = 1000;
+
 HijelHID_BLEKeyboard kb("Slide Remote", "Preston", 100);
 
 static const int SCREEN_W = 135;
@@ -68,6 +74,12 @@ static const uint8_t BRIGHT_ACTIVE = 100;
 static const uint8_t BRIGHT_IDLE   = 15;
 static const uint32_t IDLE_AFTER_MS = 30000;
 
+// Auto power-off after a long idle, so a remote left unplugged does not sit
+// draining overnight. Battery only -- suppressed while on a charger. A short
+// warning shows first, cancellable with any button, so it can't sleep mid-talk.
+static const uint32_t AUTO_OFF_MS  = 15UL * 60 * 1000;   // 15 minutes idle
+static const uint32_t AUTO_WARN_MS = 30UL * 1000;        // last 30s: warn first
+
 enum class UiMode { Pairing, Ready, BtOff };
 static UiMode   mode         = UiMode::Pairing;
 static bool     btEnabled    = true;
@@ -77,6 +89,10 @@ static uint32_t lastBattery  = 0;
 static int32_t  lastBattPct  = -1;
 static float    ripplePhase  = 0.0f;
 static uint32_t lastRipple   = 0;
+static bool     warning      = false;   // idle-sleep warning is showing
+static int      lastWarnSec  = -1;
+static bool     onExternal   = false;   // USB / charger present (auto-off off)
+static bool     lastCharging = false;   // battery currently charging
 
 // Off-screen buffer. Every frame is drawn here and pushed once, so nothing
 // flickers from erase-then-redraw. Allocated once and kept for the whole run.
@@ -160,6 +176,28 @@ static void paintLegend(LovyanGFX *g, float nextY, float nextFade,
   }
 }
 
+// A small lightning bolt, centred at (cx, cy), ~6x12, for the charging mark.
+static void drawBolt(LovyanGFX *g, int cx, int cy, uint16_t colour) {
+  g->fillTriangle(cx + 2, cy - 6, cx - 3, cy + 1, cx + 1, cy + 1, colour);
+  g->fillTriangle(cx - 2, cy + 6, cx + 3, cy - 1, cx - 1, cy - 1, colour);
+}
+
+// Battery percentage, centred at y. Green with a bolt when charging, else grey.
+static void drawBatteryLine(LovyanGFX *g, int y) {
+  if (lastBattPct < 0) return;
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%ld%%", (long)lastBattPct);
+  g->setFont(&fonts::Font0);
+  g->setTextSize(1);
+  g->setTextDatum(top_center);
+  g->setTextColor(lastCharging ? fade(150, 255, 0, 1.0f) : TFT_DARKGREY);
+  g->drawString(buf, SCREEN_W / 2, y);
+  if (lastCharging) {
+    int tw = g->textWidth(buf);
+    drawBolt(g, SCREEN_W / 2 - tw / 2 - 7, y + 4, fade(255, 220, 0, 1.0f));
+  }
+}
+
 // Full settled Ready frame (legend + status + battery), with an optional
 // per-press bump applied to one group.
 static void paintReadyInto(LovyanGFX *g, int nextDy, int backDx) {
@@ -171,13 +209,7 @@ static void paintReadyInto(LovyanGFX *g, int nextDy, int backDx) {
   g->setTextSize(2);
   g->drawString("PAIRED", SCREEN_W / 2, Y_STATUS);
 
-  if (lastBattPct >= 0) {
-    char buf[16];
-    snprintf(buf, sizeof(buf), "%ld%%", (long)lastBattPct);
-    g->setTextColor(TFT_DARKGREY);
-    g->setTextSize(1);
-    g->drawString(buf, SCREEN_W / 2, Y_BATTERY);
-  }
+  drawBatteryLine(g, Y_BATTERY);
 }
 
 static void renderReady(int nextDy = 0, int backDx = 0) {
@@ -266,12 +298,7 @@ static void paintPairingFrame(float phase) {
   g->setTextColor(TFT_ORANGE);
   g->drawString("waiting to pair", SCREEN_W / 2, 205);
 
-  if (lastBattPct >= 0) {
-    char buf[16];
-    snprintf(buf, sizeof(buf), "%ld%%", (long)lastBattPct);
-    g->setTextColor(TFT_DARKGREY);
-    g->drawString(buf, SCREEN_W / 2, 222);
-  }
+  drawBatteryLine(g, 222);
   endFrame();
 }
 
@@ -353,20 +380,23 @@ static void renderBtOff() {
   beginFrame();
   LovyanGFX *g = surface();
 
-  const int CX = RIPPLE_CX, CY = 124;
-  drawBluetoothLogo(g, CX, CY, 30, 17, fade(60, 130, 210, 1.0f), 2);
+  const int CX = RIPPLE_CX, CY = 104;
+  drawBluetoothLogo(g, CX, CY, 26, 15, fade(60, 130, 210, 1.0f), 2);
 
   // Red cross-out, drawn over the logo and past its corners.
-  thickLine(g, CX - 26, CY - 34, CX + 26, CY + 34, TFT_RED, 3);
+  thickLine(g, CX - 22, CY - 30, CX + 22, CY + 30, TFT_RED, 3);
 
   g->setFont(&fonts::Font0);
   g->setTextDatum(top_center);
   g->setTextSize(1);
   g->setTextColor(fade(150, 150, 150, 1.0f));
-  g->drawString("BLUETOOTH OFF", SCREEN_W / 2, 178);
+  g->drawString("BLUETOOTH OFF", SCREEN_W / 2, 138);
+
+  drawBatteryLine(g, 156);
+
   g->setTextColor(TFT_DARKGREY);
-  g->drawString("hold BACK button", SCREEN_W / 2, 200);
-  g->drawString("to turn back on", SCREEN_W / 2, 213);
+  g->drawString("hold BACK: reconnect", SCREEN_W / 2, 186);
+  g->drawString("hold NEXT: pair new", SCREEN_W / 2, 202);
   endFrame();
 }
 
@@ -428,6 +458,30 @@ static void toggleBt() {
   }
 }
 
+// Hold NEXT from the off screen to pair a new device: wipe every stored bond
+// and advertise fresh so a different host can bond. The old host's pairing is
+// now stale -- forget the remote there too, or it keeps trying to reconnect.
+static void pairNewDevice() {
+  Serial.println("pairing reset: clearing bonds");
+  beginFrame();
+  LovyanGFX *g = surface();
+  g->setFont(&fonts::Font0);
+  g->setTextDatum(middle_center);
+  g->setTextSize(1);
+  g->setTextColor(TFT_ORANGE);
+  g->drawString("PAIRING RESET", SCREEN_W / 2, SCREEN_H / 2 - 8);
+  g->setTextColor(TFT_DARKGREY);
+  g->drawString("connect new device", SCREEN_W / 2, SCREEN_H / 2 + 10);
+  endFrame();
+  delay(1000);
+
+  kb.clearBonds();
+  btEnabled = true;
+  kb.begin();
+  enterPairing();
+  markActive();
+}
+
 // ---------------------------------------------------------------------------
 // Shutdown: a countdown you can call off
 //
@@ -486,6 +540,47 @@ static void restoreCurrentMode() {
   else                            enterPairing();
 }
 
+// Idle-sleep warning: a countdown the user can cancel by pressing anything.
+static void renderIdleWarning(int secs) {
+  beginFrame();
+  LovyanGFX *g = surface();
+  g->setFont(&fonts::Font0);
+  g->setTextDatum(top_center);
+  g->setTextSize(1);
+  g->setTextColor(TFT_ORANGE);
+  g->drawString("SLEEPING IN", SCREEN_W / 2, 66);
+
+  char b[8];
+  snprintf(b, sizeof(b), "%d", secs);
+  g->setFont(&fonts::Orbitron_Light_32);
+  g->setTextDatum(middle_center);
+  g->setTextColor(TFT_WHITE);
+  g->drawString(b, SCREEN_W / 2, 120);
+
+  g->setFont(&fonts::Font0);
+  g->setTextDatum(top_center);
+  g->setTextColor(TFT_DARKGREY);
+  g->drawString("press any button", SCREEN_W / 2, 165);
+  g->drawString("to stay awake", SCREEN_W / 2, 178);
+  endFrame();
+}
+
+// Timer-triggered power-off. Fires with no button held, so the AXP192 cannot
+// mistake it for a power-on and reboot -- the failure mode of the manual hold.
+static void autoPowerOff() {
+  Serial.println("auto power off (idle)");
+  beginFrame();
+  LovyanGFX *g = surface();
+  g->setFont(&fonts::Font0);
+  g->setTextDatum(middle_center);
+  g->setTextSize(2);
+  g->setTextColor(TFT_ORANGE);
+  g->drawString("SLEEPING", SCREEN_W / 2, SCREEN_H / 2 - 6);
+  endFrame();
+  delay(800);
+  M5.Power.powerOff();
+}
+
 static void shutdownSequence() {
   M5.Display.setBrightness(BRIGHT_ACTIVE);
   dimmed = false;
@@ -526,6 +621,7 @@ void setup() {
   M5.begin(cfg);
   extendHardwarePowerOffDelay();
   M5.BtnB.setHoldThresh(BT_HOLD_MS);   // long-press BACK toggles Bluetooth
+  M5.BtnA.setHoldThresh(PAIR_HOLD_MS); // long-press NEXT (while off) pairs new
 
   M5.Display.setRotation(SCREEN_ROTATION);
 
@@ -547,12 +643,21 @@ void setup() {
 void loop() {
   M5.update();   // reads and debounces the buttons
 
+  // Any button, in any mode, counts as activity and resets the idle timer.
+  // Captured before markActive() clears it so a press during the sleep warning
+  // only wakes the device rather than also advancing a slide.
+  bool wasWarning = warning;
+  if (M5.BtnA.wasPressed() || M5.BtnB.wasPressed() || M5.BtnPWR.wasClicked()) markActive();
+
   if (M5.BtnPWR.wasHold() && millis() > suppressHoldUntil) { shutdownSequence(); return; }
 
   // Hold the side button to toggle Bluetooth. Outside the btEnabled block so it
   // works while off, to turn it back on. A hold never also fires a click, so
   // this can't send a stray BACK.
   if (M5.BtnB.wasHold()) { toggleBt(); return; }
+
+  // Hold NEXT while off to wipe pairings and advertise for a new device.
+  if (mode == UiMode::BtOff && M5.BtnA.wasHold()) { pairNewDevice(); return; }
 
   if (btEnabled) {
     bool paired = kb.isPaired();
@@ -566,29 +671,50 @@ void loop() {
       markActive();
     }
 
-    if (M5.BtnA.wasPressed()) { sendKey(KEY_NEXT, "NEXT"); if (mode == UiMode::Ready) pressBump(true); }
-    if (M5.BtnB.wasClicked()) { sendKey(KEY_PREV, "BACK"); if (mode == UiMode::Ready) pressBump(false); }
+    if (!wasWarning && M5.BtnA.wasPressed()) { sendKey(KEY_NEXT, "NEXT"); if (mode == UiMode::Ready) pressBump(true); }
+    if (!wasWarning && M5.BtnB.wasClicked()) { sendKey(KEY_PREV, "BACK"); if (mode == UiMode::Ready) pressBump(false); }
 
-    if (mode == UiMode::Pairing) tickPairing();
+    if (mode == UiMode::Pairing && !warning) tickPairing();
   }
 
   uint32_t now = millis();
 
-  // Report battery to the host so it shows in the iPad's Bluetooth panel,
-  // and keep the on-screen readout current.
-  if (now - lastBattery > 30000 || lastBattPct < 0) {
+  // Report battery to the host so it shows in the iPad's Bluetooth panel, note
+  // whether we are on external power, and keep the on-screen readout current.
+  if (now - lastBattery > 2000 || lastBattPct < 0) {
     lastBattery = now;
+    onExternal = M5.Power.getVBUSVoltage() > 4000;   // USB / charger present
+    auto ch = M5.Power.isCharging();
+    bool charging = (ch == decltype(ch)::is_charging);
     int32_t pct = M5.Power.getBatteryLevel();
-    if (pct != lastBattPct) {
-      lastBattPct = pct;
-      if (btEnabled) kb.setBatteryLevel((uint8_t)pct);
-      if (mode == UiMode::Ready) renderReady();
+    bool changed = (pct != lastBattPct) || (charging != lastCharging);
+    if (pct != lastBattPct && btEnabled) kb.setBatteryLevel((uint8_t)pct);
+    lastBattPct = pct;
+    lastCharging = charging;
+    if (changed && !warning) {
+      if (mode == UiMode::Ready)      renderReady();
+      else if (mode == UiMode::BtOff) renderBtOff();
     }
   }
 
-  if (!dimmed && now - lastActivity > IDLE_AFTER_MS) {
+  if (!dimmed && !warning && now - lastActivity > IDLE_AFTER_MS) {
     M5.Display.setBrightness(BRIGHT_IDLE);
     dimmed = true;
+  }
+
+  // Idle sleep: warn for the last AUTO_WARN_MS, then power off. Battery only.
+  uint32_t idle = now - lastActivity;
+  if (!onExternal && idle >= AUTO_OFF_MS - AUTO_WARN_MS) {
+    if (idle >= AUTO_OFF_MS) autoPowerOff();   // does not return
+    M5.Display.setBrightness(BRIGHT_ACTIVE);
+    dimmed = false;
+    int secs = (int)((AUTO_OFF_MS - idle + 999) / 1000);
+    if (!warning || secs != lastWarnSec) { renderIdleWarning(secs); lastWarnSec = secs; }
+    warning = true;
+  } else if (warning) {
+    warning = false;
+    lastWarnSec = -1;
+    restoreCurrentMode();
   }
 
   delay(10);
